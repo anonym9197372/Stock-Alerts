@@ -1,0 +1,7 @@
+# Deine Watchlist: ein Ticker pro Zeile, wie bei Yahoo Finance (z. B. AAPL, SAP.DE).
+# Zeilen mit # werden ignoriert. Die Datei wird bei jedem Lauf neu gelesen.
+# Neue Aktien: Zeile hinzufügen. Entfernen: Zeile löschen.
+NVDA
+TSLA
+AAPL
+MSFT
