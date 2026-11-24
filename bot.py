@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """Aktien-News-Alarm: Yahoo Finance + Google News (RSS) + SEC-8-K  ->  Push per ntfy.sh.
 
-Kein Account und keine Telefonnummer nötig. Nur Python-Standardbibliothek.
+Kein Account und keine Telefonnummer nötig. Nur Python-Standardbibliothek, keine KI.
 Die Watchlist steht in watchlist.txt und wird bei jedem Lauf neu gelesen.
+
+Pro Lauf gibt es höchstens ZWEI Pushs:
+  (Wichtig)   ...  gebündelte Liste der wichtigen Meldungen
+  (Unwichtig) ...  gebündelte Liste der übrigen Meldungen
+Ähnliche Meldungen werden zusammengefasst, Titel ins Deutsche übersetzt.
 """
 
 import html
@@ -25,15 +30,19 @@ WATCHLIST_FILE = Path(os.environ.get("WATCHLIST_FILE") or BASE / "watchlist.txt"
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 NTFY_SERVER = (os.environ.get("NTFY_SERVER", "").strip() or "https://ntfy.sh").rstrip("/")
 SEC_UA = os.environ.get("SEC_USER_AGENT", "").strip() or "stock-alerts-bot admin@example.com"
-MAX_AGE_H = int(os.environ.get("MAX_AGE_HOURS") or "12")      # ältere Meldungen ignorieren
-MAX_PUSH = int(os.environ.get("MAX_PUSH_PER_RUN") or "20")    # Schutz vor Spam
-DRY = not NTFY_TOPIC                                          # ohne Thema: nur ausgeben
+MAX_AGE_H = int(os.environ.get("MAX_AGE_HOURS") or "12")             # ältere Meldungen ignorieren
+IMPORTANT_MIN = int(os.environ.get("IMPORTANT_MIN") or "5")          # ab dieser Punktzahl: "wichtig"
+MAX_LINES_IMPORTANT = int(os.environ.get("MAX_LINES_IMPORTANT") or "12")
+MAX_LINES_OTHER = int(os.environ.get("MAX_LINES_OTHER") or "15")
+MAX_TRANSLATE = int(os.environ.get("MAX_TRANSLATE") or "30")         # Übersetzungen pro Lauf
+TRANSLATE = (os.environ.get("TRANSLATE") or "1") != "0"              # TRANSLATE=0 schaltet aus
+DRY = not NTFY_TOPIC                                                 # ohne Thema: nur ausgeben
 
 BROWSER_UA = "Mozilla/5.0 (compatible; stock-alerts-bot/1.0)"
 SEEN_TTL = 7 * 86400
 TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-=^]{0,11}$")
 
-# Bedeutung der 8-K-Item-Nummern (nur die, die für Anleger interessant sind)
+# Bedeutung der 8-K-Item-Nummern
 SEC_ITEMS = {
     "1.01": "Wichtiger Vertrag / Deal",
     "1.02": "Vertrag beendet",
@@ -54,6 +63,62 @@ SEC_ITEMS = {
     "7.01": "Mitteilung (Reg FD)",
     "8.01": "Sonstige Ereignisse",
 }
+# Diese 8-K-Typen gelten als "wichtig", der Rest als "unwichtig"
+SEC_IMPORTANT = {"1.01", "1.02", "1.03", "2.01", "2.02", "2.05", "2.06", "3.01", "4.02", "5.01", "5.02"}
+
+
+# ---------------------------------------------------------------- Bewertung (Wichtigkeit)
+
+_CEO = r"(?:ceo|chief executive|cfo|chairman|founder)"
+# "CEO ... tritt zurück/kommt zurück": Wechsel-Wort steht nach dem Titel
+_CHANGE_AFTER = (r"(?:resign\w*|steps? down|stepping down|quits?|fired|ousted|replaced?|appoint\w*|"
+                 r"names? new|returns?|exits?|departs?|departure|retires?|retirement|successor|leaves|leaving)")
+# "... Rücktritt des CEO": Wechsel-Wort steht vor dem Titel ("returns" bewusst nicht dabei)
+_CHANGE_BEFORE = (r"(?:resign\w*|steps? down|stepping down|quits?|fired|ousted|appoint\w*|"
+                  r"names? new|departure|retires?|retirement|successor)")
+
+# (Punkte, [Muster]) – jede Regel zählt höchstens einmal pro Schlagzeile
+RULES = [
+    (12, [rf"\b{_CEO}\b[^.]{{0,70}}?\b{_CHANGE_AFTER}\b",
+         rf"\b{_CHANGE_BEFORE}\b[^.]{{0,70}}?\b{_CEO}\b"]),                # Führungswechsel
+    (5, [r"\b(?:acquir\w+|acquisition|merger|takeover|buyout|take[- ]private|bankruptcy|chapter 11|"
+         r"insolven\w+|delist\w*|trading halt|halts? trading)\b"]),        # Übernahme / Pleite
+    (5, [r"\b(?:lawsuit|sues?|sued|settle\w*|antitrust|investigation|probe|subpoena|indict\w*|"
+         r"fraud|class action|fines?|fined|penalt\w+)\b"]),                # Recht / Untersuchung
+    (5, [r"\b(?:earnings|quarterly results|guidance|outlook|profit warning|beats?|misses|"
+         r"raises forecast|cuts forecast)\b"]),                            # Zahlen
+    (5, [r"\b(?:recall\w*|data breach|cyberattack|hack(?:ed)?|outage|shutdown)\b"]),
+    (5, [r"\b(?:layoffs?|job cuts|restructuring|plant closure|strike)\b"]),
+    (4, [r"\b(?:stock split|buyback|share repurchase|special dividend|dividend (?:hike|cut|increase))\b"]),
+    (4, [r"\b(?:billions?|trillions?)\b", r"\$\s?\d[\d.,]*\s?(?:bn|b)\b"]),             # große Summen
+    (3, [r"\b(?:deal|partnership|agreement|contract|investment|invests?|stake)\b"]),
+    (3, [r"\b(?:tariffs?|sanctions?|export (?:ban|controls?|curbs?|restrictions?)|bans?|banned|"
+         r"approval|approves?|fda)\b"]),
+    (3, [r"\b(?:upgrade[sd]?|downgrade[sd]?)\b"]),
+    (3, [r"\b(?:launch\w*|unveil\w*|announce\w*|introduc\w+)\b"]),
+    (1, [r"\b(?:ceo|cfo)\b"]),
+    (1, [r"\b(?:price target|forecast|analyst)\b"]),
+]
+RULES = [(w, [re.compile(p, re.I) for p in pats]) for w, pats in RULES]
+
+# Füllmaterial / Klickköder: zieht Punkte ab
+NOISE = re.compile(
+    r"\b(?:should you|better buy|stocks? to buy|millionaire|motley fool|zacks|reasons? to buy|"
+    r"if you invested|worth buying|no[- ]brainer|buy now|top \d+ stocks?|\d+ (?:stocks?|reasons|things)|"
+    r"what to know|here'?s why|ahead of earnings)\b", re.I)
+
+
+def score_news(title):
+    s = sum(w for w, pats in RULES if any(p.search(title) for p in pats))
+    if NOISE.search(title):
+        s -= 6
+    return s
+
+
+def score_item(it):
+    if it["kind"] == "sec":
+        return 10 if any(n in SEC_IMPORTANT for n in it.get("nums", [])) else 2
+    return score_news(it["title"])
 
 
 # ---------------------------------------------------------------- Hilfsfunktionen
@@ -99,16 +164,18 @@ def save_state(state):
 
 # ---------------------------------------------------------------- Push (ntfy)
 
-def send(title, message, link=None, tags=None, priority=3):
+def send(title, message, link=None, tags=None, priority=3, actions=None):
     """Schickt eine Push-Nachricht über ntfy. Gibt True zurück, wenn sie angenommen wurde."""
     if DRY:
-        print(f"--- PUSH ---\n{title}\n{message}\n{link or ''}\n")
+        print(f"--- PUSH (Prio {priority}) ---\n{title}\n{message}\n{link or ''}\n")
         return True
     body = {"topic": NTFY_TOPIC, "title": title, "message": message, "priority": priority}
     if link:
-        body["click"] = link  # Tippen auf die Push öffnet den Artikel
+        body["click"] = link  # Tippen auf die Push öffnet die wichtigste Meldung
     if tags:
         body["tags"] = tags
+    if actions:
+        body["actions"] = actions
     req = urllib.request.Request(
         NTFY_SERVER + "/",
         data=json.dumps(body).encode("utf-8"),
@@ -120,6 +187,50 @@ def send(title, message, link=None, tags=None, priority=3):
     except Exception as e:
         print(f"WARN ntfy-Push fehlgeschlagen: {type(e).__name__}", file=sys.stderr)
         return False
+
+
+# ---------------------------------------------------------------- Übersetzung (Englisch -> Deutsch)
+
+_tr_fail = 0
+_tr_count = 0
+
+
+def translate(text):
+    """Übersetzt eine Schlagzeile ins Deutsche. Bei jedem Problem kommt der Originaltext zurück."""
+    global _tr_fail, _tr_count
+    if not TRANSLATE or _tr_fail >= 2 or _tr_count >= MAX_TRANSLATE or not text:
+        return text
+    _tr_count += 1
+    out = None
+
+    # 1) Google-Übersetzer (inoffizielle, schlüsselfreie Schnittstelle)
+    raw = http_get("https://translate.googleapis.com/translate_a/single?" + urllib.parse.urlencode(
+        {"client": "gtx", "sl": "en", "tl": "de", "dt": "t", "q": text}))
+    if raw:
+        try:
+            out = "".join(seg[0] for seg in json.loads(raw)[0] if seg and seg[0]) or None
+        except Exception:
+            out = None
+
+    # 2) Ersatz: MyMemory (kostenlos, anonym begrenzt)
+    if not out:
+        raw = http_get("https://api.mymemory.translated.net/get?" + urllib.parse.urlencode(
+            {"q": text, "langpair": "en|de"}))
+        if raw:
+            try:
+                d = json.loads(raw)
+                cand = d["responseData"]["translatedText"]
+                if str(d.get("responseStatus")) == "200" and cand and "MYMEMORY WARNING" not in cand.upper():
+                    out = cand
+            except Exception:
+                out = None
+
+    if out:
+        _tr_fail = 0
+        time.sleep(0.15)  # freundlich bleiben
+        return html.unescape(out).strip()
+    _tr_fail += 1
+    return text
 
 
 # ---------------------------------------------------------------- Quellen
@@ -146,9 +257,21 @@ def parse_rss(raw):
 
 
 def norm(title):
-    """Titel normalisieren, damit dieselbe Meldung aus zwei Quellen nur einmal kommt."""
+    """Titel normalisieren, damit dieselbe Meldung aus zwei Quellen nur einmal kommt.
+    (Format unverändert, damit die gespeicherten IDs in state.json gültig bleiben.)"""
     t = re.sub(r"\s+-\s+[^-]{2,40}$", "", title)  # Google hängt " - Quelle" an
     return re.sub(r"\W+", " ", t.lower()).strip()[:90]
+
+
+_PUB = re.compile(r"\s+[-–—|]\s+([^-–—|]{2,40})$")
+
+
+def split_pub(title):
+    """'Nvidia CEO tritt zurück - Reuters' -> ('Nvidia CEO tritt zurück', 'Reuters')"""
+    m = _PUB.search(title)
+    if m:
+        return title[:m.start()].strip(), m.group(1).strip()
+    return title.strip(), None
 
 
 _sec_map = {}
@@ -202,6 +325,8 @@ def sec_filings(ticker, cik):
             "id": f"sec|{acc}",
             "kind": "sec",
             "src": "SEC",
+            "pub": "SEC",
+            "nums": nums,
             "ts": ts,
             "title": f"{form}: " + (", ".join(labels) or "Neue Pflichtmeldung"),
             "link": f"https://www.sec.gov/Archives/edgar/data/{cik}/"
@@ -220,7 +345,8 @@ def collect(ticker):
     if raw is not None:
         ok += 1
         for i in parse_rss(raw):
-            out.append({**i, "id": f"{ticker}|{norm(i['title'])}", "kind": "news", "src": "Yahoo Finance"})
+            out.append({**i, "id": f"{ticker}|{norm(i['title'])}", "kind": "news",
+                        "src": "Yahoo Finance", "pub": "Yahoo Finance"})
 
     query = f'"{short_name(info[1])}" stock' if info else f"{ticker} stock"
     raw = http_get("https://news.google.com/rss/search?q="
@@ -228,7 +354,9 @@ def collect(ticker):
     if raw is not None:
         ok += 1
         for i in parse_rss(raw):
-            out.append({**i, "id": f"{ticker}|{norm(i['title'])}", "kind": "news", "src": "Google News"})
+            clean, pub = split_pub(i["title"])
+            out.append({**i, "id": f"{ticker}|{norm(i['title'])}", "kind": "news",
+                        "src": "Google News", "pub": pub or "Google News", "title": clean})
 
     if info:
         filings = sec_filings(ticker, info[0])
@@ -238,15 +366,112 @@ def collect(ticker):
     return out, ok
 
 
+# ---------------------------------------------------------------- Zusammenfassen ähnlicher Meldungen
+
+_STOP = set("the and for with from after over amid into than more new says say said will would could "
+            "may can has have had not but about out off its this that these those are was were been "
+            "stock stocks shares share".split())
+
+
+def tokens(title):
+    words = re.findall(r"[a-z0-9]+", title.lower())
+    return {w[:-1] if len(w) > 4 and w.endswith("s") else w
+            for w in words if len(w) > 2 and w not in _STOP}
+
+
+def similar(a, b):
+    if not a or not b:
+        return False
+    inter = len(a & b)
+    return inter / len(a | b) >= 0.5 or (inter >= 4 and inter / min(len(a), len(b)) >= 0.75)
+
+
+def build_clusters(entries):
+    """entries: Liste von (Ticker, Meldung). Gibt Themen-Gruppen zurück (ähnliche Meldungen vereint)."""
+    prepared = []
+    for t, it in entries:
+        it = dict(it)
+        it["ticker"] = t
+        it["score"] = score_item(it)
+        it["tok"] = tokens(it["title"]) if it["kind"] == "news" else set()
+        prepared.append(it)
+    prepared.sort(key=lambda x: (-x["score"], -(x["ts"] or 0)))
+
+    clusters = []
+    for it in prepared:
+        target = None
+        if it["kind"] == "news":
+            for c in clusters:
+                if c["kind"] == "news" and similar(it["tok"], c["rep"]["tok"]):
+                    target = c
+                    break
+        if target is None:
+            target = {"kind": it["kind"], "rep": it, "score": it["score"], "items": [],
+                      "tickers": [], "pubs": [], "norms": set()}
+            clusters.append(target)
+        target["items"].append(it)
+        if it["ticker"] not in target["tickers"]:
+            target["tickers"].append(it["ticker"])
+        if it.get("pub") and it["pub"] not in target["pubs"]:
+            target["pubs"].append(it["pub"])
+        target["norms"].add(norm(it["title"]))
+    return clusters
+
+
+# ---------------------------------------------------------------- Push-Aufbau
+
+def short(text, n):
+    text = " ".join(text.split())
+    return text if len(text) <= n else text[:n - 1].rstrip() + "…"
+
+
+def tickers_label(c):
+    t = ", ".join(c["tickers"][:3])
+    return t + ("…" if len(c["tickers"]) > 3 else "")
+
+
+def line(c):
+    s = f"• {tickers_label(c)}: {c['title_de']}"
+    meta = []
+    if c["pubs"]:
+        meta.append(", ".join(c["pubs"][:3]) + ("…" if len(c["pubs"]) > 3 else ""))
+    extra = len(c["norms"]) - 1
+    if extra > 0:
+        meta.append(f"+{extra} ähnliche")
+    return s + (f" ({'; '.join(meta)})" if meta else "")
+
+
+def push_group(label, clusters, max_lines, priority, tags):
+    """Sendet eine gebündelte Push für eine Gruppe. True bei Erfolg (oder wenn nichts zu senden ist)."""
+    if not clusters:
+        return True
+    clusters.sort(key=lambda c: (-c["score"], -(c["rep"]["ts"] or 0)))
+    shown = clusters[:max_lines]
+    for c in shown:  # nur das übersetzen, was auch angezeigt wird
+        c["title_de"] = c["rep"]["title"] if c["kind"] == "sec" else translate(c["rep"]["title"])
+
+    n_topics = len(clusters)
+    n_items = sum(len(c["norms"]) for c in clusters)
+    head = f"{n_topics} Themen" + (f" aus {n_items} Meldungen" if n_items > n_topics else "")
+    lines, size = [head, ""], len(head)
+    for c in shown:
+        ln = line(c)
+        if size + len(ln.encode("utf-8")) > 3400:
+            break
+        lines.append(ln)
+        size += len(ln.encode("utf-8")) + 1
+    hidden = n_topics - (len(lines) - 2)
+    if hidden > 0:
+        lines.append(f"… und {hidden} weitere")
+
+    top = shown[0]
+    title = short(f"({label}) {tickers_label(top)}: {top['title_de']}", 110)
+    actions = [{"action": "view", "label": f"Meldung {i + 1}", "url": c["rep"]["link"]}
+               for i, c in enumerate(shown[:3])]
+    return send(title, "\n".join(lines), top["rep"]["link"], tags=tags, priority=priority, actions=actions)
+
+
 # ---------------------------------------------------------------- Hauptprogramm
-
-def push_item(ticker, it):
-    if it["kind"] == "sec":
-        return send(f"{ticker} · SEC-Meldung", it["title"], it["link"],
-                    tags=["rotating_light"], priority=4)
-    return send(f"{ticker} · {it['src']}", it["title"], it["link"],
-                tags=["newspaper"], priority=3)
-
 
 def main():
     if NTFY_TOPIC and len(NTFY_TOPIC) < 16:
@@ -287,20 +512,24 @@ def main():
                 continue
             queue.append((t, it))
 
-    queue.sort(key=lambda x: x[1]["ts"] or now)
-    for t, it in queue[:MAX_PUSH]:
-        if push_item(t, it):
-            state["seen"][it["id"]] = now
-            if not DRY:
-                time.sleep(0.5)  # nicht zu schnell hintereinander senden
-    rest = queue[MAX_PUSH:]
-    if rest:
-        send("Weitere Meldungen übersprungen",
-             f"{len(rest)} weitere Meldungen (Limit pro Lauf: {MAX_PUSH}).", tags=["information_source"])
-        for _, it in rest:
-            state["seen"][it["id"]] = now
+    n_imp = n_oth = 0
+    if queue:
+        clusters = build_clusters(queue)
+        important = [c for c in clusters if c["score"] >= IMPORTANT_MIN]
+        other = [c for c in clusters if c["score"] < IMPORTANT_MIN]
+        n_imp, n_oth = len(important), len(other)
+        # Wichtige zuerst (bekommen das Übersetzungs-Kontingent zuerst)
+        for label, group, lines, prio, tags in (
+            ("Wichtig", important, MAX_LINES_IMPORTANT, 4, ["rotating_light"]),
+            ("Unwichtig", other, MAX_LINES_OTHER, 2, ["newspaper"]),
+        ):
+            if push_group(label, group, lines, prio, tags):
+                for c in group:  # auch nicht angezeigte Themen gelten als erledigt
+                    for it in c["items"]:
+                        state["seen"][it["id"]] = now
 
-    print(f"Fertig: {len(queue)} neue Meldungen, Watchlist: {', '.join(wl) or '-'}")
+    print(f"Fertig: {len(queue)} neue Meldungen -> {n_imp} wichtige, {n_oth} unwichtige Themen. "
+          f"Watchlist: {', '.join(wl) or '-'}")
     save_state(state)
 
 
