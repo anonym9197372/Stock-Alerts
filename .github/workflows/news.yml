@@ -2,8 +2,8 @@ name: Stock News Alerts
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
-  workflow_dispatch:
+    - cron: "*/5 * * * *"   # alle 5 Minuten (GitHub kann das um einige Minuten verzögern)
+  workflow_dispatch:         # manueller Start-Button im Actions-Tab
 
 permissions:
   contents: write
@@ -15,7 +15,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -23,11 +23,41 @@ jobs:
         with:
           python-version: "3.12"
 
+      # ---- Optionale KI (Ollama). Nur aktiv, wenn unter Settings -> Secrets and variables -> Actions -> Variables
+      # eine Variable USE_AI mit dem Wert 1 angelegt ist. Schlägt ein Schritt fehl, läuft der Bot einfach ohne KI.
+      - name: KI-Dateien aus dem Cache holen
+        if: ${{ vars.USE_AI == '1' }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/ollama-bin
+            ~/ollama-models
+          key: ollama-v1
+
+      - name: KI starten (Ollama)
+        if: ${{ vars.USE_AI == '1' }}
+        continue-on-error: true
+        env:
+          AI_MODEL: ${{ vars.AI_MODEL || 'qwen2.5:3b' }}
+        run: |
+          set -o pipefail
+          if [ ! -x "$HOME/ollama-bin/bin/ollama" ]; then
+            mkdir -p "$HOME/ollama-bin"
+            curl -fsSL https://ollama.com/download/ollama-linux-amd64.tar.zst | tar --zstd -x -C "$HOME/ollama-bin" \
+              || curl -fsSL https://ollama.com/download/ollama-linux-amd64.tgz | tar -xz -C "$HOME/ollama-bin"
+          fi
+          export OLLAMA_MODELS="$HOME/ollama-models" OLLAMA_KEEP_ALIVE=10m OLLAMA_NUM_PARALLEL=1
+          nohup "$HOME/ollama-bin/bin/ollama" serve > "$HOME/ollama.log" 2>&1 &
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break; sleep 1; done
+          "$HOME/ollama-bin/bin/ollama" pull "$AI_MODEL"
+
       - name: Nachrichten prüfen und Push senden
         run: python bot.py
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+          AI: ${{ vars.USE_AI == '1' && '1' || '0' }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'qwen2.5:3b' }}
 
       - name: Zustand speichern
         run: |
