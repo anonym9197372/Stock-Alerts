@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Aktien-News-Alarm: Yahoo Finance + Google News (RSS) + SEC-8-K  ->  Push per ntfy.sh.
 
-Kein Account und keine Telefonnummer nötig. Nur Python-Standardbibliothek, keine KI.
+Kein Account und keine Telefonnummer nötig. Nur Python-Standardbibliothek.
+Optional: eine lokale KI (Ollama) bewertet die Themen und schreibt die deutschen Zeilen; ohne Ollama
+läuft alles wie bisher mit Regeln + Google-Übersetzung.
 Die Watchlist steht in watchlist.txt und wird bei jedem Lauf neu gelesen.
 
-Pro Lauf gibt es höchstens ZWEI Pushs:
+Pro Lauf gibt es höchstens DREI Pushs:
   (Wichtig)   ...  gebündelte Liste der wichtigen Meldungen
+  (Markt)     ...  große Meldungen außerhalb der Watchlist
   (Unwichtig) ...  gebündelte Liste der übrigen Meldungen
 Ähnliche Meldungen werden zusammengefasst, Titel ins Deutsche übersetzt.
 """
@@ -41,6 +44,13 @@ MAX_LINES_MARKET = int(os.environ.get("MAX_LINES_MARKET") or "8")
 MARKET = (os.environ.get("MARKET") or "1") != "0"                    # MARKET=0 schaltet den Markt-Teil aus
 MAX_TRANSLATE = int(os.environ.get("MAX_TRANSLATE") or "40")         # Übersetzungen pro Lauf
 TRANSLATE = (os.environ.get("TRANSLATE") or "1") != "0"              # TRANSLATE=0 schaltet aus
+AI = (os.environ.get("AI") or "1") != "0"                            # AI=0 schaltet die lokale KI aus
+OLLAMA_URL = (os.environ.get("OLLAMA_URL") or "http://127.0.0.1:11434").rstrip("/")
+AI_MODEL = os.environ.get("AI_MODEL") or "qwen2.5:3b"                # Ollama-Modell (muss per 'ollama pull' da sein)
+AI_BUDGET = float(os.environ.get("AI_BUDGET_SECONDS") or "120")      # so lange darf die KI pro Lauf höchstens rechnen
+AI_CALL_TIMEOUT = float(os.environ.get("AI_CALL_TIMEOUT") or "90")   # Limit pro KI-Anfrage (inkl. Modell laden)
+AI_BATCH = int(os.environ.get("AI_BATCH") or "6")                    # Themen pro KI-Anfrage
+AI_MAX = int(os.environ.get("AI_MAX_TOPICS") or "24")                # höchstens so viele Themen pro Lauf bewerten
 DRY = not NTFY_TOPIC                                                 # ohne Thema: nur ausgeben
 
 BROWSER_UA = "Mozilla/5.0 (compatible; stock-alerts-bot/1.0)"
@@ -232,7 +242,6 @@ def collect_market():
 # (Formular, Kategorie, Text, Punkte)
 SEC_MARKET_FORMS = [
     ("SCHEDULE 13D", "Großaktionär", "Investor meldet Beteiligung über 5 % mit möglicher Einflussnahme (Schedule 13D)", 9),
-    ("SC 13D", "Großaktionär", "Investor meldet Beteiligung über 5 % mit möglicher Einflussnahme (Schedule 13D)", 9),
     ("SC TO-T", "Übernahme", "Öffentliches Übernahmeangebot an die Aktionäre (Tender Offer)", 10),
     ("425", "Übernahme", "Mitteilung zu Fusion/Übernahme (Form 425)", 9),
     ("DEFM14A", "Übernahme", "Aktionäre stimmen über Fusion ab (Proxy DEFM14A)", 9),
@@ -385,47 +394,220 @@ def send(title, message, link=None, tags=None, priority=3, actions=None):
 
 # ---------------------------------------------------------------- Übersetzung (Englisch -> Deutsch)
 
-_tr_fail = 0
-_tr_count = 0
+_gtx_dead = False
+_mm_used = 0
+MM_MAX = 8  # MyMemory ist anonym stark begrenzt: nur wenige Einzelübersetzungen pro Lauf
+
+
+def _gtx_batch(texts):
+    """Alle Titel in EINER Anfrage an den Google-Übersetzer (inoffiziell, ohne Schlüssel)."""
+    q = "\n".join(" ".join(t.split()) for t in texts)
+    raw = http_get("https://translate.googleapis.com/translate_a/single?" + urllib.parse.urlencode(
+        {"client": "gtx", "sl": "en", "tl": "de", "dt": "t", "q": q}))
+    if not raw:
+        return None
+    try:
+        lines, tr, src = [], "", ""
+        for seg in json.loads(raw)[0]:
+            if not seg or seg[0] is None:
+                continue
+            tr += seg[0]
+            src += seg[1] or ""
+            if src.endswith("\n"):  # Zeilenende der Quelle = ein Titel ist fertig
+                lines.append(tr.strip())
+                tr = src = ""
+        if tr or src:
+            lines.append(tr.strip())
+        return lines if len(lines) == len(texts) else None
+    except Exception:
+        return None
+
+
+def _mymemory(text):
+    raw = http_get("https://api.mymemory.translated.net/get?" + urllib.parse.urlencode(
+        {"q": text, "langpair": "en|de"}))
+    if not raw:
+        return None
+    try:
+        d = json.loads(raw)
+        cand = d["responseData"]["translatedText"]
+        if str(d.get("responseStatus")) == "200" and cand and "MYMEMORY WARNING" not in cand.upper():
+            return cand
+    except Exception:
+        pass
+    return None
+
+
+def translate_many(texts):
+    """Übersetzt Schlagzeilen ins Deutsche. Bei jedem Problem bleibt der englische Originaltext."""
+    global _gtx_dead, _mm_used
+    out = list(texts)
+    if not TRANSLATE or not texts or time.time() - START - _ai["spent"] > TIME_BUDGET:
+        return out
+    texts = texts[:MAX_TRANSLATE]
+    if not _gtx_dead:
+        res = _gtx_batch(texts)
+        if res:
+            for k, r in enumerate(res):
+                out[k] = html.unescape(r).strip() or out[k]
+            return out
+        _gtx_dead = True  # blockiert (z. B. 429): in diesem Lauf nicht mehr versuchen
+    for k, t in enumerate(texts):  # Ersatz: MyMemory, nur wenige
+        if _mm_used >= MM_MAX:
+            break
+        _mm_used += 1
+        r = _mymemory(t)
+        if r:
+            out[k] = html.unescape(r).strip()
+    return out
 
 
 def translate(text):
-    """Übersetzt eine Schlagzeile ins Deutsche. Bei jedem Problem kommt der Originaltext zurück."""
-    global _tr_fail, _tr_count
-    if (not TRANSLATE or _tr_fail >= 2 or _tr_count >= MAX_TRANSLATE or not text
-            or time.time() - START > TIME_BUDGET):
-        return text
-    _tr_count += 1
-    out = None
+    return translate_many([text])[0]
 
-    # 1) Google-Übersetzer (inoffizielle, schlüsselfreie Schnittstelle)
-    raw = http_get("https://translate.googleapis.com/translate_a/single?" + urllib.parse.urlencode(
-        {"client": "gtx", "sl": "en", "tl": "de", "dt": "t", "q": text}))
-    if raw:
-        try:
-            out = "".join(seg[0] for seg in json.loads(raw)[0] if seg and seg[0]) or None
-        except Exception:
-            out = None
 
-    # 2) Ersatz: MyMemory (kostenlos, anonym begrenzt)
-    if not out:
-        raw = http_get("https://api.mymemory.translated.net/get?" + urllib.parse.urlencode(
-            {"q": text, "langpair": "en|de"}))
-        if raw:
+# ---------------------------------------------------------------- Lokale KI (Ollama, optional)
+# Läuft komplett auf dem eigenen Rechner bzw. dem GitHub-Runner: kein Konto, kein Schlüssel, keine Kosten.
+# Die KI darf NUR bewerten (0-5) und eine deutsche Zeile formulieren. Sie kann nichts löschen, was die
+# Regeln für wichtig halten, und bei jedem Problem (nicht erreichbar, zu langsam, Unsinn) gilt weiter die Regel-Logik.
+
+_ai = {"ready": None, "dead": False, "spent": 0.0, "rated": 0, "dropped": 0}
+_local = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # lokaler Dienst: nie über einen Proxy
+
+AI_SCHEMA = {"type": "object", "properties": {"items": {"type": "array", "items": {
+    "type": "object", "properties": {"n": {"type": "integer"}, "w": {"type": "integer"}, "de": {"type": "string"}},
+    "required": ["n", "w", "de"]}}}, "required": ["items"]}
+
+AI_SYSTEM = (
+    "Du bist Nachrichten-Redakteur für einen Privatanleger. Bewerte jede nummerierte Meldung und fasse sie in "
+    "EINER kurzen deutschen Zeile zusammen. Antworte ausschließlich mit JSON.\n"
+    "Wichtigkeit w:\n"
+    "5 = extrem wichtig, kann den Kurs der Firma stark bewegen (CEO-/Vorstandswechsel, Übernahme, Fusion, Pleite, "
+    "Deal über Milliarden, überraschende Quartalszahlen, Gewinnwarnung, Verbot, Sanktion, große Klage, Großrückruf)\n"
+    "4 = wichtig (konkrete Firmenneuigkeit mit echter Auswirkung)\n"
+    "3 = normale Nachricht\n"
+    "2 = Randnotiz, Analystenmeinung, Produktgerede\n"
+    "1 = Klickköder, Füllmaterial, Anlage-Ratgeber\n"
+    "0 = betrifft die genannte Firma gar nicht\n"
+    "Regeln für de: höchstens 16 Wörter, sachlich, Firmen-/Produktnamen und Zahlen behalten, nichts erfinden. "
+    "'billion' heißt Milliarde, 'trillion' heißt Billion.\n"
+    'Beispiel: {"items":[{"n":1,"w":5,"de":"Nvidia-Chef Huang tritt überraschend zurück"}]}')
+
+
+def _ollama_get(path, timeout=3):
+    with _local.open(urllib.request.Request(OLLAMA_URL + path), timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def _ollama_post(path, body, timeout):
+    req = urllib.request.Request(OLLAMA_URL + path, data=json.dumps(body).encode("utf-8"),
+                                 headers={"Content-Type": "application/json"})
+    with _local.open(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def ai_ready():
+    """Ist Ollama erreichbar und das Modell vorhanden? (Ergebnis wird pro Lauf gemerkt.)"""
+    if _ai["ready"] is None:
+        ok = False
+        if AI:
             try:
-                d = json.loads(raw)
-                cand = d["responseData"]["translatedText"]
-                if str(d.get("responseStatus")) == "200" and cand and "MYMEMORY WARNING" not in cand.upper():
-                    out = cand
-            except Exception:
-                out = None
+                names = [m.get("name", "") for m in _ollama_get("/api/tags").get("models", [])]
+                ok = any(n == AI_MODEL or n == AI_MODEL + ":latest" or (":" not in AI_MODEL and n.split(":")[0] == AI_MODEL)
+                         for n in names)
+                print(f"KI: Ollama erreichbar, Modell {AI_MODEL} " + ("bereit" if ok else
+                      f"FEHLT (vorhanden: {', '.join(names) or 'keins'}) -> Regel-Modus"))
+            except Exception as e:
+                print(f"KI: Ollama nicht erreichbar ({type(e).__name__}) -> Regel-Modus")
+        _ai["ready"] = ok
+    return _ai["ready"]
 
-    if out:
-        _tr_fail = 0
-        time.sleep(0.15)  # freundlich bleiben
-        return html.unescape(out).strip()
-    _tr_fail += 1
-    return text
+
+def _ai_line(i, c):
+    meta = [display(c["company"]) if c["company"] else "-", c["cat"]]
+    return f"{i}. Firma: {meta[0]} | Art: {meta[1]} | {short(topic_raw(c), 260)}"
+
+
+def _ai_clean(s):
+    s = re.sub(r"https?://\S+", "", str(s or "")).replace("\n", " ").strip(" \"'")
+    return " ".join(s.split())
+
+
+def _ai_batch(batch, timeout):
+    """Eine Anfrage an die KI. Gibt {Nummer: (Wichtigkeit, deutsche Zeile)} zurück."""
+    msg = "Meldungen:\n" + "\n".join(_ai_line(i + 1, c) for i, c in enumerate(batch))
+    resp = _ollama_post("/api/chat", {
+        "model": AI_MODEL, "stream": False, "format": AI_SCHEMA, "keep_alive": "10m",
+        "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 120 * len(batch)},
+        "messages": [{"role": "system", "content": AI_SYSTEM}, {"role": "user", "content": msg}]}, timeout)
+    data = json.loads(resp["message"]["content"])
+    out = {}
+    for it in data.get("items", []):
+        try:
+            n, w = int(it["n"]), int(it["w"])
+        except Exception:
+            continue
+        de = _ai_clean(it.get("de"))
+        if 1 <= n <= len(batch) and 0 <= w <= 5 and n not in out:
+            out[n] = (w, de if 8 <= len(de) <= 220 else "")
+    return out
+
+
+def ai_rate(topics):
+    """Bewertet die Themen (wichtigste zuerst, solange das Zeitbudget reicht). Setzt c['w'] und c['text_de']."""
+    if not AI or not topics or not ai_ready():
+        return
+    cand = [c for c in sorted(topics, key=lambda c: (-c["score"], -(c["rep"]["ts"] or 0)))
+            if c["rep"]["kind"] not in ("sec", "secm")][:AI_MAX]  # SEC-Meldungen sind harte Fakten: bleiben bei den Regeln
+    t0 = time.time()
+    for i in range(0, len(cand), AI_BATCH):
+        left = AI_BUDGET - (time.time() - t0)
+        if left < 8 or _ai["dead"]:
+            break
+        batch = cand[i:i + AI_BATCH]
+        try:
+            res = _ai_batch(batch, min(left, AI_CALL_TIMEOUT))
+        except Exception as e:  # zu langsam / Unsinn / Dienst weg: Rest läuft mit Regeln
+            print(f"WARN KI-Anfrage fehlgeschlagen ({type(e).__name__}) -> Rest im Regel-Modus", file=sys.stderr)
+            _ai["dead"] = True
+            break
+        for n, (w, de) in res.items():
+            c = batch[n - 1]
+            c["w"] = w
+            if de:
+                c["text_de"] = de
+            _ai["rated"] += 1
+    _ai["spent"] += time.time() - t0
+    print(f"KI: {_ai['rated']} von {len(cand)} Themen bewertet in {time.time() - t0:.0f} s")
+
+
+def is_important(c):
+    """Wichtig = Regeln und KI sind sich einig (oder die KI ist sich sehr sicher). Ohne KI-Urteil gelten die Regeln."""
+    w = c.get("w")
+    if w is None or c["rep"]["kind"] in ("sec", "secm"):
+        return c["score"] >= IMPORTANT_MIN
+    if c.get("cooled"):  # dasselbe Thema kam kürzlich schon: nur noch bei 'extrem wichtig'
+        return w >= 5
+    return w >= 4 or (w == 3 and c["score"] >= IMPORTANT_MIN)
+
+
+def rank(c):
+    """Sortierwert in einer Push: KI-Wichtigkeit, sonst aus den Regeln abgeleitet."""
+    w = c.get("w")
+    return w if w is not None else (4 if c["score"] >= IMPORTANT_MIN else 2)
+
+
+def ai_drop(state, group, now):
+    """Entfernt Themen, die die KI als 'betrifft die Firma gar nicht' (0) einstuft UND die Regeln nicht für wichtig halten."""
+    keep = []
+    for c in group:
+        if c.get("w") == 0 and c["score"] < IMPORTANT_MIN:
+            for it in c["items"]:
+                state["seen"][it["id"]] = now
+            _ai["dropped"] += 1
+        else:
+            keep.append(c)
+    return keep
 
 
 # ---------------------------------------------------------------- Quellen
@@ -796,15 +978,19 @@ def short(text, n):
     return text if len(text) <= n else text[:n - 1].rstrip() + "…"
 
 
-def topic_text(c):
-    """Deutscher Satz zum Thema. Bei Klickköder-Titeln wird der Anfang des Artikeltexts genommen."""
+def topic_raw(c):
+    """Englischer Rohtext zum Thema. Bei Klickköder-Titeln wird der Anfang des Artikeltexts genommen."""
     r = c["rep"]
     if r["kind"] in ("sec", "secm"):
         return r["title"]
     txt = r["title"]
     if is_teaser(txt) and r.get("desc"):
         txt = lead_sentence(r["desc"]) or txt
-    return translate(txt)
+    return txt
+
+
+def topic_text(c):
+    return c["rep"]["title"] if c["rep"]["kind"] in ("sec", "secm") else translate(topic_raw(c))
 
 
 def topic_line(c):
@@ -813,7 +999,13 @@ def topic_line(c):
         meta.append(", ".join(c["pubs"][:3]) + ("…" if len(c["pubs"]) > 3 else ""))
     if c["n"] > 1:
         meta.append(f"+{c['n'] - 1} weitere")
-    s = f"• {c['text_de']}" if c["cat"] == "SEC" else f"• {c['cat']}: {c['text_de']}"
+    hot = c.get("w") == 5  # extrem wichtig: Fettdruck gibt es in iPhone-Pushs nicht -> 🔴 und GROSSBUCHSTABEN
+    if c["cat"] == "SEC":
+        s = f"• {c['text_de']}"
+    elif hot:
+        s = f"• 🔴 {c['cat'].upper()}: {c['text_de']}"
+    else:
+        s = f"• {c['cat']}: {c['text_de']}"
     return s + (f" ({'; '.join(meta)})" if meta else "")
 
 
@@ -821,7 +1013,7 @@ def push_group(label, topics, max_lines, priority, tags, carry=False, per_compan
     """Sendet eine gebündelte Push (pro Firma ein Block). Gibt (Erfolg, enthaltene Themen) zurück."""
     if not topics:
         return True, []
-    topics.sort(key=lambda c: (-c["score"], -(c["rep"]["ts"] or 0)))
+    topics.sort(key=lambda c: (-rank(c), -c["score"], -(c["rep"]["ts"] or 0)))
     cand, per = [], {}
     for c in topics:
         k = c["company"]
@@ -829,8 +1021,12 @@ def push_group(label, topics, max_lines, priority, tags, carry=False, per_compan
             continue
         per[k] = per.get(k, 0) + 1
         cand.append(c)
-    for c in cand:  # nur übersetzen, was auch angezeigt wird
-        c["text_de"] = topic_text(c)
+    # nur übersetzen, was auch angezeigt wird; alle Titel in einer einzigen Anfrage
+    todo = [c for c in cand if c["rep"]["kind"] not in ("sec", "secm") and "text_de" not in c]  # KI-Zeilen sind schon deutsch
+    for c, de in zip(todo, translate_many([topic_raw(c) for c in todo])):
+        c["text_de"] = de
+    for c in cand:
+        c.setdefault("text_de", c["rep"]["title"])
 
     n_items = sum(c["n"] for c in topics)
     head = f"{len(topics)} Themen" + (f" aus {n_items} Meldungen" if n_items > len(topics) else "")
@@ -855,9 +1051,12 @@ def push_group(label, topics, max_lines, priority, tags, carry=False, per_compan
     hidden = len(topics) - len(inc)
     if hidden > 0:
         lines += ["", f"… und {hidden} weitere Themen" + (" (kommen im nächsten Lauf)" if carry else "")]
+    if any("w" in c for c in inc):
+        lines += ["", f"Sortiert von KI ({AI_MODEL})"]
 
     top = inc[0]
-    title = short(f"({label}) " + (f"{display(top['company']).upper()}: " if top["company"] else "")
+    title = short(f"({label}) " + ("🔴 " if top.get("w") == 5 else "")
+                  + (f"{display(top['company']).upper()}: " if top["company"] else "")
                   + top["text_de"], 110)
     actions = [{"action": "view", "label": f"Meldung {k + 1}", "url": c["rep"]["link"]}
                for k, c in enumerate(inc[:3])]
@@ -917,6 +1116,7 @@ def apply_cooldown(state, topics, now):
             ts = state["topics"].get(f"{c['company']}|{c['cat']}")
             if ts and now - ts < TOPIC_COOLDOWN_H * 3600:
                 c["score"] = min(c["score"], IMPORTANT_MIN - 1)
+                c["cooled"] = True
 
 
 # ---------------------------------------------------------------- Hauptprogramm
@@ -967,8 +1167,6 @@ def main():
 
     topics = build_topics(queue) if queue else []
     apply_cooldown(state, topics, now)
-    important = [c for c in topics if c["score"] >= IMPORTANT_MIN]
-    other = [c for c in topics if c["score"] < IMPORTANT_MIN]
 
     market = []
     if MARKET and time.time() - START < TIME_BUDGET:
@@ -977,6 +1175,15 @@ def main():
             apply_cooldown(state, market, now)
         except Exception as e:  # der Markt-Teil darf den Rest nie stören
             print(f"WARN Markt-Teil fehlgeschlagen: {type(e).__name__}: {e}", file=sys.stderr)
+
+    # Optionale lokale KI: bewertet Watchlist- und Markt-Themen in einem Rutsch (Fehler -> weiter mit Regeln)
+    try:
+        ai_rate(topics + market)
+        topics, market = ai_drop(state, topics, now), ai_drop(state, market, now)
+    except Exception as e:
+        print(f"WARN KI-Schicht fehlgeschlagen: {type(e).__name__}: {e}", file=sys.stderr)
+    important = [c for c in topics if is_important(c)]
+    other = [c for c in topics if not is_important(c)]
 
     # Reihenfolge: Wichtig, Markt, Unwichtig (die ersten bekommen das Übersetzungs-Kontingent zuerst).
     # carry=True: was nicht in die Push passt, kommt im nächsten Lauf.
@@ -994,7 +1201,8 @@ def main():
                     state["topics"][f"{c['company']}|{c['cat']}"] = now
 
     print(f"Fertig: {len(queue)} neue Watchlist-Meldungen -> {len(important)} wichtige, {len(other)} unwichtige "
-          f"Themen; Markt: {len(market)} Themen. Watchlist: {', '.join(wl) or '-'}")
+          f"Themen; Markt: {len(market)} Themen; KI: {_ai['rated']} bewertet, {_ai['dropped']} aussortiert. "
+          f"Watchlist: {', '.join(wl) or '-'}")
     save_state(state)
 
 
