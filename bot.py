@@ -474,24 +474,33 @@ def translate(text):
 _ai = {"ready": None, "dead": False, "spent": 0.0, "rated": 0, "dropped": 0}
 _local = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # lokaler Dienst: nie über einen Proxy
 
+AI_CATS = ["Führung", "Übernahme", "Recht", "Zahlen", "Störfall", "Stellen", "Kapital", "Deal", "Politik",
+           "Produkt", "Analysten", "Kurs", "Sonstiges"]
 AI_SCHEMA = {"type": "object", "properties": {"items": {"type": "array", "items": {
-    "type": "object", "properties": {"n": {"type": "integer"}, "w": {"type": "integer"}, "de": {"type": "string"}},
-    "required": ["n", "w", "de"]}}}, "required": ["items"]}
+    "type": "object",
+    "properties": {"n": {"type": "integer"}, "w": {"type": "integer"}, "k": {"type": "string", "enum": AI_CATS},
+                   "de": {"type": "string"}, "who": {"type": "string"}},
+    "required": ["n", "w", "k", "de", "who"]}}}, "required": ["items"]}
 
 AI_SYSTEM = (
-    "Du bist Nachrichten-Redakteur für einen Privatanleger. Bewerte jede nummerierte Meldung und fasse sie in "
-    "EINER kurzen deutschen Zeile zusammen. Antworte ausschließlich mit JSON.\n"
-    "Wichtigkeit w:\n"
-    "5 = extrem wichtig, kann den Kurs der Firma stark bewegen (CEO-/Vorstandswechsel, Übernahme, Fusion, Pleite, "
-    "Deal über Milliarden, überraschende Quartalszahlen, Gewinnwarnung, Verbot, Sanktion, große Klage, Großrückruf)\n"
-    "4 = wichtig (konkrete Firmenneuigkeit mit echter Auswirkung)\n"
-    "3 = normale Nachricht\n"
-    "2 = Randnotiz, Analystenmeinung, Produktgerede\n"
-    "1 = Klickköder, Füllmaterial, Anlage-Ratgeber\n"
-    "0 = betrifft die genannte Firma gar nicht\n"
-    "Regeln für de: höchstens 16 Wörter, sachlich, Firmen-/Produktnamen und Zahlen behalten, nichts erfinden. "
-    "'billion' heißt Milliarde, 'trillion' heißt Billion.\n"
-    'Beispiel: {"items":[{"n":1,"w":5,"de":"Nvidia-Chef Huang tritt überraschend zurück"}]}')
+    "Du bist Nachrichten-Redakteur für Privatanleger, die viele der Firmen nicht kennen. Antworte ausschließlich "
+    "mit JSON. Zu jeder nummerierten Meldung lieferst du:\n"
+    "w = Wichtigkeit 0-5. SEI STRENG: von 10 Meldungen ist höchstens eine eine 5, die meisten sind 2 oder 3. "
+    "Eine Milliardensumme allein macht eine Meldung nicht wichtig.\n"
+    "  5 = muss ein Anleger sofort wissen (CEO-/Vorstandswechsel, Übernahme/Fusion einer großen Firma, Pleite, "
+    "Gewinnwarnung, überraschende Quartalszahlen, Verbot, Sanktion, große Klage, Großrückruf)\n"
+    "  4 = wichtig, konkrete Firmenneuigkeit mit echter Auswirkung\n"
+    "  3 = normale Nachricht   2 = Randnotiz, Analystenmeinung   1 = Klickköder, Füllmaterial, Ratgeber\n"
+    "  0 = betrifft die genannte Firma gar nicht\n"
+    "k = die passende Kategorie.\n"
+    "de = EIN einfacher deutscher Satz, höchstens 20 Wörter, ohne Fachjargon: was ist passiert und, wenn erkennbar, "
+    "warum es wichtig ist. Nicht wörtlich übersetzen, sondern in einfachen Worten erklären. Firmennamen, Zahlen und "
+    "Währungen behalten, nichts erfinden. 'billion' heißt Milliarde (Mrd.), 'trillion' heißt Billion.\n"
+    "who = nur wenn bei der Meldung 'Firma: -' steht und die Firma kein bekannter Weltkonzern ist: "
+    "'Name: kurze Beschreibung' (höchstens 7 Wörter, z. B. 'Flipkart: indischer Online-Händler, gehört Walmart'). "
+    "Bist du nicht sicher oder ist die Firma allgemein bekannt: leere Zeichenkette.\n"
+    'Beispiel: {"items":[{"n":1,"w":5,"k":"Führung","de":"Nvidia-Chef Huang tritt überraschend zurück, '
+    'ein Nachfolger ist noch nicht genannt.","who":""}]}')
 
 
 def _ollama_get(path, timeout=3):
@@ -534,7 +543,7 @@ def _ai_clean(s):
 
 
 def _ai_batch(batch, timeout):
-    """Eine Anfrage an die KI. Gibt {Nummer: (Wichtigkeit, deutsche Zeile)} zurück."""
+    """Eine Anfrage an die KI. Gibt {Nummer: (Wichtigkeit, Kategorie, deutsche Zeile, Firmenhinweis)} zurück."""
     msg = "Meldungen:\n" + "\n".join(_ai_line(i + 1, c) for i, c in enumerate(batch))
     resp = _ollama_post("/api/chat", {
         "model": AI_MODEL, "stream": False, "format": AI_SCHEMA, "keep_alive": "10m",
@@ -547,9 +556,12 @@ def _ai_batch(batch, timeout):
             n, w = int(it["n"]), int(it["w"])
         except Exception:
             continue
-        de = _ai_clean(it.get("de"))
+        de, who = _ai_clean(it.get("de")), _ai_clean(it.get("who"))
+        k = it.get("k") if it.get("k") in AI_CATS else ""
         if 1 <= n <= len(batch) and 0 <= w <= 5 and n not in out:
-            out[n] = (w, de if 8 <= len(de) <= 220 else "")
+            ok_de = 8 <= len(de) <= 240 and not _looks_english(de, batch[n - 1])
+            ok_who = 3 <= len(who) <= 70 and ":" in who and not batch[n - 1]["company"]
+            out[n] = (w, k, de if ok_de else "", who if ok_who else "")
     return out
 
 
@@ -571,14 +583,74 @@ def ai_rate(topics):
             print(f"WARN KI-Anfrage fehlgeschlagen ({type(e).__name__}) -> Rest im Regel-Modus", file=sys.stderr)
             _ai["dead"] = True
             break
-        for n, (w, de) in res.items():
+        for n, (w, k, de, who) in res.items():
             c = batch[n - 1]
             c["w"] = w
+            if k and k != "Sonstiges" and c["cat"] not in _NO_MERGE:  # "Sonstiges" der KI überschreibt keine konkrete Regel-Kategorie
+                c["cat"] = k
             if de:
                 c["text_de"] = de
+            if who:
+                c["who"] = who
             _ai["rated"] += 1
     _ai["spent"] += time.time() - t0
     print(f"KI: {_ai['rated']} von {len(cand)} Themen bewertet in {time.time() - t0:.0f} s")
+
+
+_EN_STOP = set("the a an of for and with from after over amid into than to in on at as by is are was were be "
+               "its his her their says say said will would could may new".split())
+
+
+def _looks_english(de, c):
+    """Hat die KI den englischen Titel nur abgeschrieben? (Dann lieber verwerfen und übersetzen.)"""
+    w_de = set(re.findall(r"[a-zäöüß0-9]+", de.lower()))
+    w_en = set(re.findall(r"[a-z0-9]+", topic_raw(c).lower()))
+    if not w_de:
+        return True
+    overlap = len(w_de & w_en) / len(w_de)
+    stop = len([w for w in re.findall(r"[a-z]+", de.lower()) if w in _EN_STOP])
+    return overlap > 0.6 or stop >= 3
+
+
+def ai_cap(group, keep=2):
+    """Die KI vergibt gern zu viele 5er. Pro Push bleiben höchstens `keep` als 'extrem wichtig', der Rest wird 4."""
+    top = sorted([c for c in group if c.get("w") == 5], key=lambda c: (-c["score"], -(c["rep"]["ts"] or 0)))
+    for c in top[keep:]:
+        c["w"] = 4
+
+
+def ai_translate(cand):
+    """Themen ohne brauchbare KI-Zeile: die KI übersetzt/erklärt nur den Titel (kurze Anfrage). Fehler -> bleibt leer."""
+    todo = [c for c in cand if "text_de" not in c and c["rep"]["kind"] not in ("sec", "secm")]
+    if not AI or not todo or _ai["dead"] or not ai_ready():
+        return
+    t0 = time.time()
+    for i in range(0, len(todo), 8):
+        left = AI_BUDGET - _ai["spent"] - (time.time() - t0)
+        if left < 8:
+            break
+        batch = todo[i:i + 8]
+        msg = "Erkläre jede Schlagzeile in EINEM einfachen deutschen Satz (höchstens 20 Wörter), antworte als JSON " \
+              '{"items":[{"n":1,"de":"..."}]}:\n' + "\n".join(f"{k + 1}. {short(topic_raw(c), 260)}" for k, c in enumerate(batch))
+        try:
+            resp = _ollama_post("/api/chat", {
+                "model": AI_MODEL, "stream": False, "keep_alive": "10m",
+                "format": {"type": "object", "properties": {"items": {"type": "array", "items": {
+                    "type": "object", "properties": {"n": {"type": "integer"}, "de": {"type": "string"}},
+                    "required": ["n", "de"]}}}, "required": ["items"]},
+                "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 70 * len(batch)},
+                "messages": [{"role": "system", "content": "Du übersetzt und erklärst Börsennachrichten für Laien auf Deutsch. "
+                              "'billion' heißt Milliarde, 'trillion' heißt Billion. Nichts erfinden."},
+                             {"role": "user", "content": msg}]}, min(left, AI_CALL_TIMEOUT))
+            for it in json.loads(resp["message"]["content"]).get("items", []):
+                n, de = int(it["n"]), _ai_clean(it.get("de"))
+                if 1 <= n <= len(batch) and 8 <= len(de) <= 240 and not _looks_english(de, batch[n - 1]):
+                    batch[n - 1]["text_de"] = de
+        except Exception as e:
+            print(f"WARN KI-Übersetzung fehlgeschlagen ({type(e).__name__}) -> Google", file=sys.stderr)
+            _ai["dead"] = True
+            break
+    _ai["spent"] += time.time() - t0
 
 
 def is_important(c):
@@ -785,6 +857,9 @@ def similar(a, b):
     if names_a and names_b and not (names_a & names_b):
         return False  # andere Firmen -> andere Geschichte
     inter = len(a & b)
+    nums = len([t for t in a & b if any(ch.isdigit() for ch in t)])
+    if names_a & names_b and nums >= 2 and inter >= 4:
+        return True  # gleiche Firma und gleiche Summe (z. B. '$7.5B') -> dieselbe Geschichte, nur anders formuliert
     return inter / len(a | b) >= 0.5 or (inter >= 4 and inter / min(len(a), len(b)) >= 0.75)
 
 
@@ -1006,6 +1081,8 @@ def topic_line(c):
         s = f"• 🔴 {c['cat'].upper()}: {c['text_de']}"
     else:
         s = f"• {c['cat']}: {c['text_de']}"
+    if c.get("who"):
+        s += f" [{c['who']}]"
     return s + (f" ({'; '.join(meta)})" if meta else "")
 
 
@@ -1021,6 +1098,7 @@ def push_group(label, topics, max_lines, priority, tags, carry=False, per_compan
             continue
         per[k] = per.get(k, 0) + 1
         cand.append(c)
+    ai_translate(cand)  # Themen ohne KI-Zeile: erst die lokale KI, dann (nur Rest) Google
     # nur übersetzen, was auch angezeigt wird; alle Titel in einer einzigen Anfrage
     todo = [c for c in cand if c["rep"]["kind"] not in ("sec", "secm") and "text_de" not in c]  # KI-Zeilen sind schon deutsch
     for c, de in zip(todo, translate_many([topic_raw(c) for c in todo])):
@@ -1180,6 +1258,8 @@ def main():
     try:
         ai_rate(topics + market)
         topics, market = ai_drop(state, topics, now), ai_drop(state, market, now)
+        ai_cap(market)
+        ai_cap([c for c in topics if is_important(c)])
     except Exception as e:
         print(f"WARN KI-Schicht fehlgeschlagen: {type(e).__name__}: {e}", file=sys.stderr)
     important = [c for c in topics if is_important(c)]
