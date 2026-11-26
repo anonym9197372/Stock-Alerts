@@ -6,11 +6,11 @@ Optional: eine lokale KI (Ollama) bewertet die Themen und schreibt die deutschen
 läuft alles wie bisher mit Regeln + Google-Übersetzung.
 Die Watchlist steht in watchlist.txt und wird bei jedem Lauf neu gelesen.
 
-Pro Lauf gibt es höchstens DREI Pushs:
-  (Wichtig)   ...  gebündelte Liste der wichtigen Meldungen
-  (Markt)     ...  große Meldungen außerhalb der Watchlist
-  (Unwichtig) ...  gebündelte Liste der übrigen Meldungen
-Ähnliche Meldungen werden zusammengefasst, Titel ins Deutsche übersetzt.
+Zwei Arten von Pushs:
+  (Wichtig) 🔴        ...  eine eigene Push pro wirklich dringender Meldung (höchstens MAX_URGENT pro Lauf),
+                           mit verständlicher Erklärung: Was ist passiert? Warum wichtig?
+  (Zusammenfassung)  ...  alles andere, gesammelt und höchstens alle DIGEST_HOURS Stunden als EINE Push
+Ähnliche Meldungen werden zusammengefasst, alles ist auf Deutsch.
 """
 
 import html
@@ -51,6 +51,13 @@ AI_BUDGET = float(os.environ.get("AI_BUDGET_SECONDS") or "120")      # so lange 
 AI_CALL_TIMEOUT = float(os.environ.get("AI_CALL_TIMEOUT") or "90")   # Limit pro KI-Anfrage (inkl. Modell laden)
 AI_BATCH = int(os.environ.get("AI_BATCH") or "6")                    # Themen pro KI-Anfrage
 AI_MAX = int(os.environ.get("AI_MAX_TOPICS") or "24")                # höchstens so viele Themen pro Lauf bewerten
+AI_MODEL_URGENT = os.environ.get("AI_MODEL_URGENT") or AI_MODEL       # optional: größeres Modell nur für Eilmeldungen
+AI_DEEP_BUDGET = float(os.environ.get("AI_DEEP_BUDGET_SECONDS") or "100")  # Zeit für Eilmeldungs-Texte + Überblick
+URGENT_MIN = int(os.environ.get("URGENT_MIN") or "10")                # ohne KI: ab dieser Regel-Punktzahl = dringend
+MAX_URGENT = int(os.environ.get("MAX_URGENT") or "3")                 # höchstens so viele Einzel-Pushs pro Lauf
+DIGEST_H = float(os.environ.get("DIGEST_HOURS") or "3")               # Zusammenfassung höchstens alle x Stunden
+DIGEST_MAX_LINES = int(os.environ.get("DIGEST_MAX_LINES") or "18")    # Zeilen pro Zusammenfassung
+DIGEST_FORCE = int(os.environ.get("DIGEST_FORCE_AT") or "40")         # ab so vielen gesammelten Meldungen sofort senden
 DRY = not NTFY_TOPIC                                                 # ohne Thema: nur ausgeben
 
 BROWSER_UA = "Mozilla/5.0 (compatible; stock-alerts-bot/1.0)"
@@ -353,6 +360,8 @@ def load_state():
     s.setdefault("baselined", [])
     s.setdefault("greeted", False)
     s.setdefault("topics", {})
+    s.setdefault("pending", [])      # Meldungen für die nächste Zusammenfassung
+    s.setdefault("urgent_log", [])   # schon gesendete Eilmeldungen (gegen Wiederholungen)
     return s
 
 
@@ -360,6 +369,8 @@ def save_state(state):
     cutoff = time.time() - SEEN_TTL
     state["seen"] = {k: v for k, v in state["seen"].items() if v > cutoff}
     state["topics"] = {k: v for k, v in state.get("topics", {}).items() if v > time.time() - 86400}
+    state["urgent_log"] = [l for l in state.get("urgent_log", []) if l["ts"] > time.time() - 86400]
+    state["pending"] = [r for r in state.get("pending", []) if r["t"] > time.time() - 36 * 3600][:120]
     tmp = STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=1, sort_keys=True), encoding="utf-8")
     tmp.replace(STATE_FILE)
@@ -471,7 +482,7 @@ def translate(text):
 # Die KI darf NUR bewerten (0-5) und eine deutsche Zeile formulieren. Sie kann nichts löschen, was die
 # Regeln für wichtig halten, und bei jedem Problem (nicht erreichbar, zu langsam, Unsinn) gilt weiter die Regel-Logik.
 
-_ai = {"ready": None, "dead": False, "spent": 0.0, "rated": 0, "dropped": 0}
+_ai = {"ready": None, "dead": False, "spent": 0.0, "deep_spent": 0.0, "rated": 0, "dropped": 0, "deep": 0}
 _local = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # lokaler Dienst: nie über einen Proxy
 
 AI_CATS = ["Führung", "Übernahme", "Recht", "Zahlen", "Störfall", "Stellen", "Kapital", "Deal", "Politik",
@@ -537,6 +548,20 @@ def _ai_line(i, c):
     return f"{i}. Firma: {meta[0]} | Art: {meta[1]} | {short(topic_raw(c), 260)}"
 
 
+def _numkeys(text):
+    return {re.sub(r"\D", "", n).lstrip("0") for n in re.findall(r"\d[\d.,]*", text or "")} - {""}
+
+
+def _nums_ok(out, source):
+    """Erfundene Zahlen abfangen: jede Zahl (ab 2 Ziffern) im KI-Text muss auch in der Quelle stehen ('$7.5B' = '7,5')."""
+    src = _numkeys(source)
+    return all(k in src or len(k) < 2 for k in _numkeys(out))
+
+
+def _ai_source(c):
+    return " ".join(f"{it['title']} {it.get('desc', '')}" for it in c["items"])
+
+
 def _ai_clean(s):
     s = re.sub(r"https?://\S+", "", str(s or "")).replace("\n", " ").strip(" \"'")
     return " ".join(s.split())
@@ -559,7 +584,8 @@ def _ai_batch(batch, timeout):
         de, who = _ai_clean(it.get("de")), _ai_clean(it.get("who"))
         k = it.get("k") if it.get("k") in AI_CATS else ""
         if 1 <= n <= len(batch) and 0 <= w <= 5 and n not in out:
-            ok_de = 8 <= len(de) <= 240 and not _looks_english(de, batch[n - 1])
+            ok_de = (8 <= len(de) <= 240 and not _looks_english(de, batch[n - 1])
+                     and _nums_ok(de, _ai_source(batch[n - 1])))
             ok_who = 3 <= len(who) <= 70 and ":" in who and not batch[n - 1]["company"]
             out[n] = (w, k, de if ok_de else "", who if ok_who else "")
     return out
@@ -612,8 +638,8 @@ def _looks_english(de, c):
     return overlap > 0.6 or stop >= 3
 
 
-def ai_cap(group, keep=2):
-    """Die KI vergibt gern zu viele 5er. Pro Push bleiben höchstens `keep` als 'extrem wichtig', der Rest wird 4."""
+def ai_cap(group, keep):
+    """Die KI vergibt gern zu viele 5er. Höchstens `keep` bleiben 'extrem wichtig', der Rest wird 4."""
     top = sorted([c for c in group if c.get("w") == 5], key=lambda c: (-c["score"], -(c["rep"]["ts"] or 0)))
     for c in top[keep:]:
         c["w"] = 4
@@ -644,23 +670,14 @@ def ai_translate(cand):
                              {"role": "user", "content": msg}]}, min(left, AI_CALL_TIMEOUT))
             for it in json.loads(resp["message"]["content"]).get("items", []):
                 n, de = int(it["n"]), _ai_clean(it.get("de"))
-                if 1 <= n <= len(batch) and 8 <= len(de) <= 240 and not _looks_english(de, batch[n - 1]):
+                if (1 <= n <= len(batch) and 8 <= len(de) <= 240 and not _looks_english(de, batch[n - 1])
+                        and _nums_ok(de, _ai_source(batch[n - 1]))):
                     batch[n - 1]["text_de"] = de
         except Exception as e:
             print(f"WARN KI-Übersetzung fehlgeschlagen ({type(e).__name__}) -> Google", file=sys.stderr)
             _ai["dead"] = True
             break
     _ai["spent"] += time.time() - t0
-
-
-def is_important(c):
-    """Wichtig = Regeln und KI sind sich einig (oder die KI ist sich sehr sicher). Ohne KI-Urteil gelten die Regeln."""
-    w = c.get("w")
-    if w is None or c["rep"]["kind"] in ("sec", "secm"):
-        return c["score"] >= IMPORTANT_MIN
-    if c.get("cooled"):  # dasselbe Thema kam kürzlich schon: nur noch bei 'extrem wichtig'
-        return w >= 5
-    return w >= 4 or (w == 3 and c["score"] >= IMPORTANT_MIN)
 
 
 def rank(c):
@@ -680,6 +697,98 @@ def ai_drop(state, group, now):
         else:
             keep.append(c)
     return keep
+
+
+DEEP_SCHEMA = {"type": "object", "properties": {
+    "urgent": {"type": "boolean"}, "head": {"type": "string"}, "was": {"type": "string"},
+    "warum": {"type": "string"}, "wer": {"type": "string"}},
+    "required": ["urgent", "head", "was", "warum", "wer"]}
+
+DEEP_SYSTEM = (
+    "Du schreibst Eilmeldungen für einen Privatanleger OHNE Vorwissen. Nutze AUSSCHLIESSLICH die gelieferten "
+    "Schlagzeilen und Texte. Erfinde nichts: keine Zahlen, Namen, Gründe oder Folgen, die dort nicht stehen. "
+    "Einfaches Deutsch, kurze Sätze, Fachwörter kurz erklären. Antworte nur mit JSON:\n"
+    "urgent = true nur, wenn ein Anleger das noch heute wissen sollte (Führungswechsel, Übernahme/Fusion, Pleite, "
+    "Gewinnwarnung, große Klage/Verbot/Sanktion, Großrückruf, Deal über Milliarden mit klarer Wirkung). "
+    "Bei bloßem Gerede, Analystenmeinungen, Ratgebern oder unklarer Lage: false.\n"
+    "head = Titelzeile mit Firmennamen, höchstens 80 Zeichen.\n"
+    "was = 1-2 Sätze: Was ist passiert?\n"
+    "warum = 1 Satz: Warum kann das für Aktionäre wichtig sein? Vorsichtig formulieren ('kann', 'könnte'), "
+    "keine Kursprognose.\n"
+    "wer = 1 Satz, was die Firma macht, nur wenn sie nicht allgemein bekannt ist und du sicher bist, ohne Zahlen. "
+    "Sonst leere Zeichenkette.\n"
+    "'billion' heißt Milliarde (Mrd.), 'trillion' heißt Billion.")
+
+
+def _deep_budget_left():
+    return AI_DEEP_BUDGET - _ai["deep_spent"]
+
+
+def ai_deep(c):
+    """Eilmeldungs-Text für EIN Thema: {urgent, head, was, warum, wer} oder None (-> Regel-Text als Ersatz)."""
+    if not AI or _ai["dead"] or not ai_ready() or _deep_budget_left() < 10:
+        return None
+    t0 = time.time()
+    heads = [f"- {it['title']} ({it.get('pub', '')})" for it in
+             sorted(c["items"], key=lambda x: -(x.get("ts") or 0))[:5]]
+    texts = [it["desc"] for it in c["items"] if it.get("desc")][:2]
+    msg = (f"Firma: {display(c['company']) if c['company'] else '(nicht angegeben, aus den Schlagzeilen entnehmen)'}\nKategorie: {c['cat']}\nSchlagzeilen:\n"
+           + "\n".join(heads) + ("\nTexte:\n" + "\n".join(f"- {t}" for t in texts) if texts else ""))
+    try:
+        resp = _ollama_post("/api/chat", {
+            "model": AI_MODEL_URGENT, "stream": False, "format": DEEP_SCHEMA, "keep_alive": "10m",
+            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 450},
+            "messages": [{"role": "system", "content": DEEP_SYSTEM}, {"role": "user", "content": msg}]},
+            min(_deep_budget_left(), AI_CALL_TIMEOUT))
+        d = json.loads(resp["message"]["content"])
+        out = {"urgent": d["urgent"], "head": _ai_clean(d["head"]), "was": _ai_clean(d["was"]),
+               "warum": _ai_clean(d["warum"]), "wer": _ai_clean(d.get("wer"))}
+    except Exception as e:
+        print(f"WARN KI-Eilmeldung fehlgeschlagen ({type(e).__name__}) -> Regel-Text", file=sys.stderr)
+        _ai["dead"] = True
+        return None
+    finally:
+        dt = time.time() - t0
+        _ai["deep_spent"] += dt
+        _ai["spent"] += dt
+    src = _ai_source(c)
+    ok = (isinstance(out["urgent"], bool) and 10 <= len(out["head"]) <= 120 and 20 <= len(out["was"]) <= 450
+          and 10 <= len(out["warum"]) <= 340 and not _looks_english(out["was"], c)
+          and _nums_ok(out["head"] + " " + out["was"] + " " + out["warum"], src)
+          and not re.search(r"\d", out["wer"]) and len(out["wer"]) <= 160)
+    if not ok:
+        print("WARN KI-Eilmeldung verworfen (Format/Zahlen passen nicht zur Quelle) -> Regel-Text", file=sys.stderr)
+        return None
+    _ai["deep"] += 1
+    return out
+
+
+def ai_overview(recs):
+    """1-2 Sätze Überblick über die wichtigsten Zeilen der Zusammenfassung ('' bei jedem Problem)."""
+    if not AI or len(recs) < 3 or _ai["dead"] or not ai_ready() or _deep_budget_left() < 10:
+        return ""
+    src = "\n".join(f"- {r['name'] or 'Markt'}: {r['text']}" for r in recs[:8])
+    t0 = time.time()
+    try:
+        resp = _ollama_post("/api/chat", {
+            "model": AI_MODEL_URGENT, "stream": False, "keep_alive": "10m",
+            "format": {"type": "object", "properties": {"ueberblick": {"type": "string"}}, "required": ["ueberblick"]},
+            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 150},
+            "messages": [{"role": "system", "content": "Du fasst Börsennachrichten für einen Privatanleger zusammen. "
+                          "Schreibe höchstens 2 kurze Sätze in einfachem Deutsch: was war insgesamt los? Nutze nur die "
+                          "Liste, erfinde nichts, keine Kursprognose. Antworte als JSON {\"ueberblick\": \"...\"}."},
+                         {"role": "user", "content": src}]}, min(_deep_budget_left(), AI_CALL_TIMEOUT))
+        out = _ai_clean(json.loads(resp["message"]["content"]).get("ueberblick"))
+    except Exception as e:
+        print(f"WARN KI-Überblick fehlgeschlagen ({type(e).__name__})", file=sys.stderr)
+        return ""
+    finally:
+        dt = time.time() - t0
+        _ai["deep_spent"] += dt
+        _ai["spent"] += dt
+    if not (20 <= len(out) <= 340) or not _nums_ok(out, src) or len(re.findall(r"\b(?:the|and|for|with)\b", out.lower())) >= 2:
+        return ""
+    return out
 
 
 # ---------------------------------------------------------------- Quellen
@@ -1064,82 +1173,129 @@ def topic_raw(c):
     return txt
 
 
-def topic_text(c):
-    return c["rep"]["title"] if c["rep"]["kind"] in ("sec", "secm") else translate(topic_raw(c))
-
-
-def topic_line(c):
-    meta = []
-    if c["pubs"]:
-        meta.append(", ".join(c["pubs"][:3]) + ("…" if len(c["pubs"]) > 3 else ""))
-    if c["n"] > 1:
-        meta.append(f"+{c['n'] - 1} weitere")
-    hot = c.get("w") == 5  # extrem wichtig: Fettdruck gibt es in iPhone-Pushs nicht -> 🔴 und GROSSBUCHSTABEN
-    if c["cat"] == "SEC":
-        s = f"• {c['text_de']}"
-    elif hot:
-        s = f"• 🔴 {c['cat'].upper()}: {c['text_de']}"
-    else:
-        s = f"• {c['cat']}: {c['text_de']}"
-    if c.get("who"):
-        s += f" [{c['who']}]"
-    return s + (f" ({'; '.join(meta)})" if meta else "")
-
-
-def push_group(label, topics, max_lines, priority, tags, carry=False, per_company=2):
-    """Sendet eine gebündelte Push (pro Firma ein Block). Gibt (Erfolg, enthaltene Themen) zurück."""
-    if not topics:
-        return True, []
-    topics.sort(key=lambda c: (-rank(c), -c["score"], -(c["rep"]["ts"] or 0)))
-    cand, per = [], {}
-    for c in topics:
-        k = c["company"]
-        if (k and per.get(k, 0) >= per_company) or len(cand) >= max_lines:
-            continue
-        per[k] = per.get(k, 0) + 1
-        cand.append(c)
-    ai_translate(cand)  # Themen ohne KI-Zeile: erst die lokale KI, dann (nur Rest) Google
-    # nur übersetzen, was auch angezeigt wird; alle Titel in einer einzigen Anfrage
-    todo = [c for c in cand if c["rep"]["kind"] not in ("sec", "secm") and "text_de" not in c]  # KI-Zeilen sind schon deutsch
+def ensure_german(cands):
+    """Sorgt für eine deutsche Zeile pro Thema: KI-Zeile > KI-Übersetzung > Google > englischer Originaltitel."""
+    cands = [c for c in cands if "text_de" not in c]
+    ai_translate(cands)
+    todo = [c for c in cands if "text_de" not in c and c["rep"]["kind"] not in ("sec", "secm")]
     for c, de in zip(todo, translate_many([topic_raw(c) for c in todo])):
         c["text_de"] = de
-    for c in cand:
+    for c in cands:
         c.setdefault("text_de", c["rep"]["title"])
 
-    n_items = sum(c["n"] for c in topics)
-    head = f"{len(topics)} Themen" + (f" aus {n_items} Meldungen" if n_items > len(topics) else "")
-    blocks, order, inc, size = {}, [], [], len(head)
-    for c in cand:
-        ln = topic_line(c)
-        if size + len(ln.encode("utf-8")) > 3400:
+
+def src_names(c):
+    s = ", ".join(c["pubs"][:3]) + ("…" if len(c["pubs"]) > 3 else "")
+    return s + (f" (+{c['n'] - 1} weitere Meldungen)" if c["n"] > 1 else "")
+
+
+def is_urgent(c, state, now):
+    """Dringend = Einzel-Push. Mit KI: Bewertung 5. Ohne KI (und bei SEC-Meldungen): hohe Regel-Punktzahl.
+    Folgemeldungen zu einer schon gesendeten Eilmeldung kommen nur noch in die Zusammenfassung."""
+    r, w = c["rep"], c.get("w")
+    ok = c["score"] >= URGENT_MIN if (w is None or r["kind"] in ("sec", "secm")) else w >= 5
+    if not ok:
+        return False
+    tok = tokens(r["title"]) if r["kind"] == "news" else set()
+    for l in state.get("urgent_log", []):
+        if now - l["ts"] <= 86400 and l["co"] == c["company"] and tok and similar(tok, set(l["tok"])):
+            return False
+    return True
+
+
+def send_urgent(c):
+    """Eine Eilmeldung. Rückgabe: True = gesendet, False = Fehler (wird erneut versucht), None = 'doch nicht dringend'."""
+    r = c["rep"]
+    deep = ai_deep(c) if r["kind"] == "news" else None
+    if deep and not deep["urgent"]:
+        return None
+    name = display(c["company"]).upper() if c["company"] else ""
+    if deep:
+        head = deep["head"] if (not name or name.lower() in deep["head"].lower()) else f"{name}: {deep['head']}"
+        body = [deep["was"], "", "Warum wichtig: " + deep["warum"]] + (["", deep["wer"]] if deep["wer"] else [])
+        title = short("(Wichtig) 🔴 " + head, 110)
+    else:
+        ensure_german([c])
+        title = short("(Wichtig) 🔴 " + (f"{name}: " if name else "") + c["text_de"], 110)
+        body = [c["text_de"]]
+        if r["kind"] in ("sec", "secm"):
+            body += ["", "Offizielle Pflichtmeldung bei der US-Börsenaufsicht SEC. Die Details stehen im verlinkten Dokument."]
+        if c.get("who"):
+            body += ["", c["who"]]
+    body += ["", "Quelle: " + src_names(c)]
+    links = list(dict.fromkeys(it["link"] for it in sorted(c["items"], key=lambda x: -(x.get("ts") or 0))))[:3]
+    actions = [{"action": "view", "label": f"Quelle {k + 1}", "url": u} for k, u in enumerate(links)]
+    return send(title, "\n".join(body), r["link"], tags=["rotating_light"], priority=4, actions=actions)
+
+
+def to_record(c, now):
+    """Thema -> kleiner Eintrag für die Zusammenfassung (wird in state.json gesammelt)."""
+    return {"name": display(c["company"]) if c["company"] else "", "cat": c["cat"], "w": c.get("w"), "sc": c["score"],
+            "text": c["text_de"], "who": c.get("who", ""), "mkt": bool(c.get("mkt")), "link": c["rep"]["link"],
+            "pubs": ", ".join(c["pubs"][:3]) + ("…" if len(c["pubs"]) > 3 else "") + (f" +{c['n'] - 1}" if c["n"] > 1 else ""),
+            "ts": c["rep"]["ts"] or now, "t": now}
+
+
+def rec_rank(r):
+    w = r["w"]
+    return w if w is not None else (4 if r["sc"] >= IMPORTANT_MIN else 2)
+
+
+def rec_line(r, with_name=False):
+    mark = "🟠 " if rec_rank(r) >= 4 else ""
+    cat = "" if r["cat"] == "SEC" else f"{r['cat']}: "
+    nm = f"{r['name'].upper()} – " if with_name and r["name"] else ""
+    s = f"• {mark}{nm}{cat}{r['text']}"
+    if r.get("who"):
+        s += f" [{r['who']}]"
+    return s + (f" ({r['pubs']})" if r["pubs"] else "")
+
+
+def maybe_digest(state, now):
+    """Sendet die gesammelten Meldungen als EINE Zusammenfassung (höchstens alle DIGEST_H Stunden)."""
+    pend = state["pending"]
+    pend[:] = [r for r in pend if now - r["t"] < 36 * 3600]
+    if not pend:
+        return False
+    if now - (state.get("last_digest") or now) < DIGEST_H * 3600 and len(pend) < DIGEST_FORCE:
+        return False
+    pend.sort(key=lambda r: (-rec_rank(r), -r["sc"], -r["ts"]))
+    chosen, size = [], 700
+    for r in pend:
+        b = len(rec_line(r, True).encode("utf-8")) + 1
+        if len(chosen) >= DIGEST_MAX_LINES or size + b > 3500:
             break
-        size += len(ln.encode("utf-8")) + 1
-        if c["company"] not in blocks:
-            blocks[c["company"]] = []
-            order.append(c["company"])
-        blocks[c["company"]].append(ln)
-        inc.append(c)
-
-    lines = [head]
-    for comp in order:
+        chosen.append(r)
+        size += b
+    ov = ai_overview(chosen)
+    lines = ([f"Überblick: {ov}", ""] if ov else [])
+    for mkt, head in ((False, "DEINE AKTIEN"), (True, "MARKT (nicht auf deiner Liste)")):
+        grp = [r for r in chosen if r["mkt"] == mkt]
+        if not grp:
+            continue
+        lines.append(head)
+        if mkt:
+            lines += [rec_line(r, True) for r in grp]
+        else:
+            for nm in dict.fromkeys(r["name"] for r in grp):
+                lines.append(nm.upper())
+                lines += [rec_line(r) for r in grp if r["name"] == nm]
         lines.append("")
-        if comp:
-            lines.append(display(comp).upper())
-        lines.extend(blocks[comp])
-    hidden = len(topics) - len(inc)
-    if hidden > 0:
-        lines += ["", f"… und {hidden} weitere Themen" + (" (kommen im nächsten Lauf)" if carry else "")]
-    if any("w" in c for c in inc):
-        lines += ["", f"Sortiert von KI ({AI_MODEL})"]
-
-    top = inc[0]
-    title = short(f"({label}) " + ("🔴 " if top.get("w") == 5 else "")
-                  + (f"{display(top['company']).upper()}: " if top["company"] else "")
-                  + top["text_de"], 110)
-    actions = [{"action": "view", "label": f"Meldung {k + 1}", "url": c["rep"]["link"]}
-               for k, c in enumerate(inc[:3])]
-    ok = send(title, "\n".join(lines), top["rep"]["link"], tags=tags, priority=priority, actions=actions)
-    return ok, inc
+    left = len(pend) - len(chosen)
+    if left:
+        lines.append(f"… und {left} weitere Meldungen (kommen in der nächsten Zusammenfassung)")
+    if any(rec_rank(r) >= 4 for r in chosen):
+        lines += ["", "🟠 = wichtig, aber nicht dringend"]
+    top = chosen[0]
+    title = short(f"(Zusammenfassung) {len(chosen)} Meldungen – " + (f"{top['name'].upper()}: " if top["name"] else "")
+                  + top["text"], 110)
+    actions = [{"action": "view", "label": f"Meldung {k + 1}", "url": r["link"]} for k, r in enumerate(chosen[:3])]
+    if send(title, "\n".join(lines).strip(), top["link"], tags=["newspaper"], priority=2, actions=actions):
+        ids = {id(r) for r in chosen}
+        pend[:] = [r for r in pend if id(r) not in ids]
+        state["last_digest"] = now
+        return True
+    return False
 
 
 def prepare_market(state, wl, queue, offtopic, now):
@@ -1253,35 +1409,51 @@ def main():
             apply_cooldown(state, market, now)
         except Exception as e:  # der Markt-Teil darf den Rest nie stören
             print(f"WARN Markt-Teil fehlgeschlagen: {type(e).__name__}: {e}", file=sys.stderr)
+    for c in market:
+        c["mkt"] = True
 
     # Optionale lokale KI: bewertet Watchlist- und Markt-Themen in einem Rutsch (Fehler -> weiter mit Regeln)
     try:
         ai_rate(topics + market)
         topics, market = ai_drop(state, topics, now), ai_drop(state, market, now)
-        ai_cap(market)
-        ai_cap([c for c in topics if is_important(c)])
     except Exception as e:
         print(f"WARN KI-Schicht fehlgeschlagen: {type(e).__name__}: {e}", file=sys.stderr)
-    important = [c for c in topics if is_important(c)]
-    other = [c for c in topics if not is_important(c)]
+    cands = topics + market
+    ai_cap(cands, MAX_URGENT)
 
-    # Reihenfolge: Wichtig, Markt, Unwichtig (die ersten bekommen das Übersetzungs-Kontingent zuerst).
-    # carry=True: was nicht in die Push passt, kommt im nächsten Lauf.
-    for label, group, max_lines, prio, tags, carry, per_co in (
-        ("Wichtig", important, MAX_LINES_IMPORTANT, 4, ["rotating_light"], True, 2),
-        ("Markt", market, MAX_LINES_MARKET, 3, ["globe_with_meridians"], True, 2),
-        ("Unwichtig", other, MAX_LINES_OTHER, 2, ["newspaper"], False, 1),
-    ):
-        ok, shown = push_group(label, group, max_lines, prio, tags, carry, per_co)
-        if ok:
-            for c in (shown if carry else group):
-                for it in c["items"]:
-                    state["seen"][it["id"]] = now
-                if label != "Unwichtig" and c["company"] and c["cat"] not in _NO_MERGE:
-                    state["topics"][f"{c['company']}|{c['cat']}"] = now
+    # 1) Dringendes: je eine eigene Push mit verständlichem Text
+    urg = sorted([c for c in cands if is_urgent(c, state, now)],
+                 key=lambda c: (-rank(c), -c["score"], -(c["rep"]["ts"] or 0)))
+    urgent, overflow = urg[:MAX_URGENT], urg[MAX_URGENT:]
+    ids = {id(c) for c in urgent}
+    rest = [c for c in cands if id(c) not in ids]  # inkl. Überzähliger: nichts geht verloren
+    n_urgent = 0
+    for c in urgent:
+        res = send_urgent(c)
+        if res is True:
+            n_urgent += 1
+            for it in c["items"]:
+                state["seen"][it["id"]] = now
+            if c["company"] and c["cat"] not in _NO_MERGE:
+                state["topics"][f"{c['company']}|{c['cat']}"] = now
+            state["urgent_log"].append({"ts": now, "co": c["company"],
+                                        "tok": sorted(tokens(c["rep"]["title"]))[:30] if c["rep"]["kind"] == "news" else []})
+        elif res is None:
+            rest.append(c)  # KI: doch nicht dringend -> Zusammenfassung
+        # False: Push gescheitert -> nicht als gesehen markieren, nächster Lauf versucht es erneut
 
-    print(f"Fertig: {len(queue)} neue Watchlist-Meldungen -> {len(important)} wichtige, {len(other)} unwichtige "
-          f"Themen; Markt: {len(market)} Themen; KI: {_ai['rated']} bewertet, {_ai['dropped']} aussortiert. "
+    # 2) Alles andere: deutsche Zeile sicherstellen und für die Zusammenfassung sammeln
+    ensure_german(rest)
+    state.setdefault("last_digest", now)
+    for c in sorted(rest, key=lambda c: (-rank(c), -c["score"])):
+        state["pending"].append(to_record(c, now))
+        for it in c["items"]:
+            state["seen"][it["id"]] = now
+    sent_digest = maybe_digest(state, now)
+
+    print(f"Fertig: {len(queue)} neue Watchlist-Meldungen -> {n_urgent} dringend gesendet, {len(rest)} in die "
+          f"Zusammenfassung (gesammelt: {len(state['pending'])}, gesendet: {'ja' if sent_digest else 'nein'}); "
+          f"KI: {_ai['rated']} bewertet, {_ai['deep']} Eilmeldungstexte, {_ai['dropped']} aussortiert. "
           f"Watchlist: {', '.join(wl) or '-'}")
     save_state(state)
 
